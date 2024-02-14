@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["circuit","commitment","evaluation","snark"],"trait":["AbsorbInROTrait","CurveCycleEquipped","Engine","Group","PrimeFieldExt","ROCircuitTrait","ROTrait","TranscriptEngineTrait","TranscriptReprTrait"],"type":["Dual","ROConstants","ROConstantsCircuit"]};
