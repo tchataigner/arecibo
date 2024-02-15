@@ -11,10 +11,10 @@ use arecibo::{
   CompressedSNARK, PublicParams, RecursiveSNARK,
 };
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
-use ff::{Field, PrimeField, PrimeFieldBits};
-use flate2::{write::ZlibEncoder, Compression};
+use ff::PrimeField;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use halo2curves::bn256::Bn256;
-use num_bigint::BigUint;
 use std::marker::PhantomData;
 use std::time::Instant;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
@@ -23,12 +23,12 @@ use tracing_texray::TeXRayLayer;
 /*******************************************************
  * Our side
  *******************************************************/
-trait ChunkStepCircuit<F: PrimeField> {
+trait ChunkStepCircuit<F: PrimeField>: Clone + Sync + Send {
   fn new() -> Self;
 
   fn arity() -> usize;
 
-  fn chunk_synthesize<CS>(
+  fn chunk_synthesize<CS: ConstraintSystem<F>>(
     &self,
     cs: &mut CS,
     z: &[AllocatedNum<F>],
@@ -36,25 +36,24 @@ trait ChunkStepCircuit<F: PrimeField> {
   ) -> Result<Vec<AllocatedNum<F>>, SynthesisError>;
 }
 
-trait ChunkCircuit {
-  fn new<F: PrimeField, C: ChunkStepCircuit<F>>(
-    z0_primary: &[F],
-    intermediate_steps_input: &[F],
-  ) -> Self;
-  fn initial_input(&self);
+trait ChunkCircuit<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> {
+  fn new(z0_primary: &[F], intermediate_steps_input: &[F]) -> Self;
+  fn initial_input(&self) -> Option<&FoldStep<F, C, N>>;
   fn num_fold_steps(&self) -> usize;
 }
 
 struct FoldStep<F: PrimeField, C: ChunkStepCircuit<F> + Clone, const N: usize> {
+  step_nbr: usize,
   circuit: C,
   next_input: [F; N],
 }
 
 impl<F: PrimeField, C: ChunkStepCircuit<F> + Clone, const N: usize> FoldStep<F, C, N> {
-  pub fn new(circuit: C, inputs: [F; N]) -> Self {
+  pub fn new(circuit: C, inputs: [F; N], step_nbr: usize) -> Self {
     Self {
       circuit,
       next_input: inputs,
+      step_nbr,
     }
   }
 }
@@ -62,6 +61,7 @@ impl<F: PrimeField, C: ChunkStepCircuit<F> + Clone, const N: usize> FoldStep<F, 
 impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> Clone for FoldStep<F, C, N> {
   fn clone(&self) -> Self {
     FoldStep {
+      step_nbr: self.step_nbr,
       circuit: self.circuit.clone(),
       next_input: self.next_input.clone(),
     }
@@ -70,7 +70,7 @@ impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> Clone for FoldStep<F
 
 impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> StepCircuit<F> for FoldStep<F, C, N> {
   fn arity(&self) -> usize {
-    N + self.circuit.arity()
+    N + C::arity()
   }
 
   fn synthesize<CS: ConstraintSystem<F>>(
@@ -78,9 +78,22 @@ impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> StepCircuit<F> for F
     cs: &mut CS,
     z: &[AllocatedNum<F>],
   ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
-    let (z_in, chunk_in) = z.split_at(self.circuit.arity());
-    let mut z_out = self.circuit.chunk_synthesize(cs, z_in, chunk_in)?;
-    z_out.extend(self.next_input.iter());
+    let (z_in, chunk_in) = z.split_at(C::arity());
+    // TODO pass folding step
+    let mut z_out = self.circuit.chunk_synthesize(
+      &mut cs.namespace(|| format!("chunk_folding_step_{}", self.step_nbr)),
+      z_in,
+      chunk_in,
+    )?;
+
+    let next_inputs_allocated = self
+      .next_input
+      .iter()
+      .enumerate()
+      .map(|(i, x)| AllocatedNum::alloc(cs.namespace(|| format!("next_input_{i}")), || Ok(*x)))
+      .collect::<Result<Vec<AllocatedNum<F>>, SynthesisError>>()?;
+
+    z_out.extend(next_inputs_allocated.into_iter());
     Ok(z_out)
   }
 }
@@ -90,7 +103,9 @@ struct Circuit<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> {
   num_fold_steps: usize,
 }
 
-impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> ChunkCircuit for Circuit<F, C, N> {
+impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> ChunkCircuit<F, C, N>
+  for Circuit<F, C, N>
+{
   fn new(z0_primary: &[F], intermediate_steps_input: &[F]) -> Self {
     assert_eq!(
       intermediate_steps_input.len() % N,
@@ -98,7 +113,13 @@ impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> ChunkCircuit for Cir
       "intermediate_steps_input must be a multiple of N"
     );
     Self {
-      circuits: C::new(),
+      circuits: (0..intermediate_steps_input.len())
+        .step_by(N)
+        .map(|i| {
+          let inputs = intermediate_steps_input[i..i + N].try_into().unwrap();
+          FoldStep::new(C::new(), inputs, i)
+        })
+        .collect::<Vec<_>>(),
       num_fold_steps: intermediate_steps_input.len() / N,
     }
   }
@@ -116,6 +137,7 @@ impl<F: PrimeField, C: ChunkStepCircuit<F>, const N: usize> ChunkCircuit for Cir
  * User side
  *******************************************************/
 
+#[derive(Clone)]
 struct ChunkStep<F: PrimeField> {
   _p: PhantomData<F>,
 }
@@ -131,7 +153,7 @@ impl<F: PrimeField> ChunkStepCircuit<F> for ChunkStep<F> {
     1
   }
 
-  fn chunk_synthesize<CS>(
+  fn chunk_synthesize<CS: ConstraintSystem<F>>(
     &self,
     cs: &mut CS,
     z: &[AllocatedNum<F>],
@@ -161,7 +183,6 @@ fn main() {
 
   const num_iters_per_step: usize = 3;
 
-  type C1 = Circuit<<Bn256EngineKZG as Engine>::GE, ChunkStep<_>, num_iters_per_step>;
   type E1 = Bn256EngineKZG;
   type E2 = GrumpkinEngine;
   type EE1 = arecibo::provider::hyperkzg::EvaluationEngine<Bn256, E1>;
@@ -169,10 +190,33 @@ fn main() {
   type S1 = arecibo::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
   type S2 = arecibo::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
 
+  type C1 = Circuit<<E1 as Engine>::Scalar, ChunkStep<<E1 as Engine>::Scalar>, num_iters_per_step>;
   // number of iterations of MinRoot per Nova's recursive step
-  let circuit_primary = C1::default();
+  let circuit_primary = C1::new(
+    &[
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+    ],
+    &[
+      <E1 as Engine>::Scalar::one(),
+      <E1 as Engine>::Scalar::from(2),
+      <E1 as Engine>::Scalar::from(3),
+      <E1 as Engine>::Scalar::from(4),
+      <E1 as Engine>::Scalar::from(5),
+      <E1 as Engine>::Scalar::from(6),
+      <E1 as Engine>::Scalar::from(7),
+      <E1 as Engine>::Scalar::from(8),
+      <E1 as Engine>::Scalar::from(9),
+      <E1 as Engine>::Scalar::from(0),
+      <E1 as Engine>::Scalar::from(0),
+      <E1 as Engine>::Scalar::from(0),
+    ],
+  );
 
-  let circuit_secondary = TrivialCircuit::default();
+  dbg!(circuit_primary.num_fold_steps());
+
+  let circuit_secondary: TrivialCircuit<<E2 as Engine>::Scalar> = TrivialCircuit::default();
 
   println!("Proving {num_iters_per_step} iterations of MinRoot per step");
 
@@ -180,66 +224,35 @@ fn main() {
   let start = Instant::now();
   println!("Producing public parameters...");
   let pp = PublicParams::<E1>::setup(
-    &circuit_primary,
+    circuit_primary.initial_input().unwrap(),
     &circuit_secondary,
     &*S1::ck_floor(),
     &*S2::ck_floor(),
   );
   println!("PublicParams::setup, took {:?} ", start.elapsed());
 
-  println!(
-    "Number of constraints per step (primary circuit): {}",
-    pp.num_constraints().0
-  );
-  println!(
-    "Number of constraints per step (secondary circuit): {}",
-    pp.num_constraints().1
-  );
-
-  println!(
-    "Number of variables per step (primary circuit): {}",
-    pp.num_variables().0
-  );
-  println!(
-    "Number of variables per step (secondary circuit): {}",
-    pp.num_variables().1
-  );
-  /*
   // produce non-deterministic advice
-  let (z0_primary, minroot_iterations) = MinRootIteration::<<E1 as Engine>::GE>::new(
-    num_iters_per_step * num_steps,
-    &<E1 as Engine>::Scalar::zero(),
-    &<E1 as Engine>::Scalar::one(),
-  );
-  let minroot_circuits = (0..num_steps)
-    .map(|i| MinRootCircuit {
-      seq: (0..num_iters_per_step)
-        .map(|j| MinRootIteration {
-          x_i: minroot_iterations[i * num_iters_per_step + j].x_i,
-          y_i: minroot_iterations[i * num_iters_per_step + j].y_i,
-          x_i_plus_1: minroot_iterations[i * num_iters_per_step + j].x_i_plus_1,
-          y_i_plus_1: minroot_iterations[i * num_iters_per_step + j].y_i_plus_1,
-        })
-        .collect::<Vec<_>>(),
-    })
-    .collect::<Vec<_>>();
+  let inner_circuits = circuit_primary.circuits;
 
   let z0_secondary = vec![<E2 as Engine>::Scalar::zero()];
 
-  type C1 = MinRootCircuit<<E1 as Engine>::GE>;
-  type C2 = TrivialCircuit<<E2 as Engine>::Scalar>;
   // produce a recursive SNARK
   println!("Generating a RecursiveSNARK...");
-  let mut recursive_snark: RecursiveSNARK<E1, E2, C1, C2> = RecursiveSNARK::<E1, E2, C1, C2>::new(
+  let mut recursive_snark: RecursiveSNARK<E1> = RecursiveSNARK::<E1>::new(
     &pp,
-    &minroot_circuits[0],
+    inner_circuits.get(0).unwrap(),
     &circuit_secondary,
-    &z0_primary,
+    &[
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+    ],
     &z0_secondary,
   )
   .unwrap();
 
-  for (i, circuit_primary) in minroot_circuits.iter().enumerate() {
+  for (i, circuit_primary) in inner_circuits.iter().enumerate() {
     let start = Instant::now();
     let res = recursive_snark.prove_step(&pp, circuit_primary, &circuit_secondary);
     assert!(res.is_ok());
@@ -254,27 +267,31 @@ fn main() {
   // verify the recursive SNARK
   println!("Verifying a RecursiveSNARK...");
   let start = Instant::now();
-  let res = recursive_snark.verify(&pp, num_steps, &z0_primary, &z0_secondary);
+  let res = recursive_snark.verify(
+    &pp,
+    circuit_primary.num_fold_steps,
+    &[
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+    ],
+    &z0_secondary,
+  );
   println!(
     "RecursiveSNARK::verify: {:?}, took {:?}",
     res.is_ok(),
     start.elapsed()
   );
   assert!(res.is_ok());
-
+  let (z_out, _) = res.unwrap();
+  println!("Calculated sum: {:?}", z_out.get(0).unwrap());
   // produce a compressed SNARK
   println!("Generating a CompressedSNARK using Spartan with multilinear KZG...");
-  let (pk, vk) = CompressedSNARK::<_, _, _, _, S1, S2>::setup(&pp).unwrap();
+  let (pk, vk) = CompressedSNARK::<_, S1, S2>::setup(&pp).unwrap();
 
   let start = Instant::now();
-  type E1 = Bn256EngineKZG;
-  type E2 = GrumpkinEngine;
-  type EE1 = arecibo::provider::hyperkzg::EvaluationEngine<Bn256, E1>;
-  type EE2 = arecibo::provider::ipa_pc::EvaluationEngine<E2>;
-  type S1 = arecibo::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
-  type S2 = arecibo::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
-
-  let res = CompressedSNARK::<_, _, _, _, S1, S2>::prove(&pp, &pk, &recursive_snark);
+  let res = CompressedSNARK::<_, S1, S2>::prove(&pp, &pk, &recursive_snark);
   println!(
     "CompressedSNARK::prove: {:?}, took {:?}",
     res.is_ok(),
@@ -294,12 +311,22 @@ fn main() {
   // verify the compressed SNARK
   println!("Verifying a CompressedSNARK...");
   let start = Instant::now();
-  let res = compressed_snark.verify(&vk, num_steps, &z0_primary, &z0_secondary);
+  let res = compressed_snark.verify(
+    &vk,
+    circuit_primary.num_fold_steps,
+    &[
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+      <E1 as Engine>::Scalar::zero(),
+    ],
+    &z0_secondary,
+  );
   println!(
     "CompressedSNARK::verify: {:?}, took {:?}",
     res.is_ok(),
     start.elapsed()
   );
   assert!(res.is_ok());
-  println!("=========================================================");*/
+  println!("=========================================================");
 }
